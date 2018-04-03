@@ -1,39 +1,68 @@
 package main
 
 import (
+	"bytes"
 	"encoding/xml"
 	"flag"
 	"fmt"
-	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/json"
 	"github.com/pubsubhubbub/gohubbub"
 	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 	"time"
 )
 
-var host = flag.String("host", "", "Host or IP to serve from")
-var port = flag.Int("port", 10000, "The port to serve from")
-
 func main() {
-	raw := flag.Bool("raw", true, "Print raw http results.")
+	host := flag.String("host", "", "Host or IP to serve from")
+	port := flag.Int("port", 10000, "The port to serve from")
+	youtubeId := flag.String("youtubeId", "", "Set the youtube ID of the channel to follow")
+	slackHook := flag.String("slackHook", "", "Set the Slack hook for the correct slack server")
+
 	flag.Parse()
-	if *raw {
-		r := gin.Default()
-		r.Any("/", handleGin)
-		r.Run(":8081")
-	} else {
-		medium()
-	}
+
+	log.Println("Youtube channel watcher started...")
+	sub := "https://www.youtube.com/xml/feeds/videos.xml?channel_id=" + *youtubeId
+	client := gohubbub.NewClient("https://pubsubhubbub.appspot.com", *host, *port, "Youtube Slacker")
+	client.Subscribe(sub,
+		func(contentType string, body []byte) {
+			var feed Feed
+			xmlError := xml.Unmarshal(body, &feed)
+
+			if xmlError != nil {
+				log.Printf("XML Parse Error %v", xmlError)
+
+			} else {
+				for _, entry := range feed.Entries {
+					log.Printf("%s by %s (%s)", entry.Title, entry.Author.Name, entry.URL)
+					postEntryToSlack(entry, *slackHook)
+				}
+			}
+		})
+
+	go client.StartServer()
+
+	termChan := make(chan os.Signal, 1)
+	signal.Notify(termChan, syscall.SIGTERM, syscall.SIGINT)
+	<-termChan
+	go func() {
+		time.Sleep(10 * time.Second)
+		panic("Unclean shutdown.")
+	}()
+
+	client.Unsubscribe(sub)
+
+	time.Sleep(time.Second * 5)
 }
 
-func handleGin(c *gin.Context) {
-	fmt.Printf("Content type: %v\n", c.ContentType())
-	data, err := c.GetRawData()
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-	} else {
-		fmt.Printf("Page: %v\n", string(data))
-	}
-	c.Status(204)
+type setup struct {
+	host      string
+	port      int
+	youtubeId string
+	slackUrl  string
 }
 
 type Feed struct {
@@ -52,34 +81,34 @@ type Author struct {
 	Name string `xml:"name"`
 }
 
-func medium() {
+type slackPost struct {
+	Text string `json:"text"`
+}
 
-	log.Println("Medium Story Watcher Started...")
+func postEntryToSlack(entry Entry, url string) {
+	httpCli := &http.Client{}
+	content := "application/json"
 
-	client := gohubbub.NewClient("http://medium.superfeedr.com", *host, *port, "Test App")
-	client.Subscribe("https://medium.com/feed/latest", func(contentType string, body []byte) {
-		var feed Feed
-		xmlError := xml.Unmarshal(body, &feed)
+	// Expecting format (yt:video:[id])
+	split := strings.Split(entry.URL, ":")
+	if len(split) < 3 {
+		fmt.Printf("URL could not be decoded: %v\n", entry.URL)
+	}
 
-		if xmlError != nil {
-			log.Printf("XML Parse Error %v", xmlError)
+	slackMsg := fmt.Sprintf("%v <https://youtu.be/%v>", entry.Title, split[2])
+	slackStruct := slackPost{slackMsg}
+	slackByte, err := json.Marshal(slackStruct)
 
-		} else {
-			for _, entry := range feed.Entries {
-				log.Printf("%s by %s (%s)", entry.Title, entry.Author.Name, entry.URL)
-			}
-		}
-	})
-
-	go client.StartServer()
-
-	time.Sleep(time.Second * 5)
-	log.Println("Press Enter for graceful shutdown...")
-
-	var input string
-	fmt.Scanln(&input)
-
-	client.Unsubscribe("https://medium.com/feed/latest")
-
-	time.Sleep(time.Second * 5)
+	dataRead := strings.NewReader(string(slackByte))
+	resp, err := httpCli.Post(url, content, dataRead)
+	if err != nil {
+		fmt.Printf("Could not create post: %v\n", err)
+	}
+	fmt.Printf("Reponse: %v\n", resp.Status)
+	buf := bytes.Buffer{}
+	_, err = buf.ReadFrom(resp.Body)
+	if err != nil {
+		fmt.Printf("Could not read reponse body %v\n", err)
+	}
+	fmt.Printf("Body: %v\n", buf.String())
 }
