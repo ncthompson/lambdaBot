@@ -27,6 +27,7 @@ type Subscription struct {
 	handler  func(string, []byte) // Content-Type, ResponseBody
 	lease    time.Duration
 	verified bool
+	close chan struct{}
 }
 
 func (s Subscription) String() string {
@@ -74,7 +75,8 @@ func NewClient(hubURL string, self string, port int, from string) *Client {
 // an update notification is received.  If a handler already exists it will be
 // overridden.
 func (client *Client) Subscribe(topic string, handler func(string, []byte)) {
-	subscription := &Subscription{topic, len(client.subscriptions), handler, 0, false}
+	subscription := &Subscription{topic, len(client.subscriptions),
+		handler, 0, false, make(chan struct{})}
 	client.subscriptions[topic] = subscription
 	if client.running {
 		client.makeSubscriptionRequest(subscription)
@@ -84,6 +86,7 @@ func (client *Client) Subscribe(topic string, handler func(string, []byte)) {
 // Unsubscribe sends an unsubscribe notification and removes the subscription.
 func (client *Client) Unsubscribe(topic string) {
 	if subscription, exists := client.subscriptions[topic]; exists {
+		close(subscription.close)
 		delete(client.subscriptions, topic)
 		if client.running {
 			client.makeUnsubscribeRequeast(subscription)
@@ -174,6 +177,19 @@ func (client *Client) handleRequest(resp http.ResponseWriter, req *http.Request)
 	log.Println("Request Received!")
 }
 
+//Could still mis the time spent with resubscribing
+func (client *Client) resubscribe(subscription *Subscription) {
+	timer := time.NewTimer(subscription.lease)
+	select {
+	case _,ok := <- subscription.close:
+		if !ok {
+			return
+		}
+	case <- timer.C:
+		client.makeSubscriptionRequest(subscription)
+	}
+}
+
 func (client *Client) handleCallback(resp http.ResponseWriter, req *http.Request) {
 	defer req.Body.Close()
 	requestBody, err := ioutil.ReadAll(req.Body)
@@ -196,6 +212,7 @@ func (client *Client) handleCallback(resp http.ResponseWriter, req *http.Request
 			}
 
 			log.Printf("Subscription verified for %s, lease is %s", topic, subscription.lease)
+			go client.resubscribe(subscription)
 			resp.Write([]byte(params.Get("hub.challenge")))
 
 		} else {
